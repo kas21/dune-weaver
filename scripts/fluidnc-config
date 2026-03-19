@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""FluidNC config editor — modify settings that require a config file rewrite.
+
+Works entirely over USB serial using XMODEM-1K/CRC16 file transfer.
+No WiFi or HTTP needed.
+
+Usage:
+    # Toggle direction inversion on an axis
+    ./scripts/fluidnc-config invert x
+    ./scripts/fluidnc-config invert y
+
+    # Set any config value by YAML path
+    ./scripts/fluidnc-config set axes/x/motor0/stepstick/direction_pin "I2SO.2:low"
+    ./scripts/fluidnc-config set axes/x/max_rate_mm_per_min 800
+
+    # Dump current config to stdout
+    ./scripts/fluidnc-config dump
+
+    # Download config to a local file
+    ./scripts/fluidnc-config download config_backup.yaml
+
+    # Upload a local YAML file to the controller
+    ./scripts/fluidnc-config upload config.yaml
+
+Options:
+    -p, --port PORT    Serial port (default: auto-detect)
+    -b, --baud BAUD    Baud rate (default: 115200)
+    --no-reboot        Skip reboot after changes
+    --dry-run          Show what would change without applying
+
+Requires: pyserial, pyyaml (already in requirements.txt)
+"""
+
+import argparse
+import io
+import struct
+import sys
+import time
+
+import serial
+import serial.tools.list_ports
+import yaml
+
+
+# ── Serial helpers ───────────────────────────────────────────────────────────
+
+IGNORE_PORTS = {"/dev/cu.debug-console", "/dev/cu.Bluetooth-Incoming-Port"}
+DEPRIORITIZED_PORTS = {"/dev/ttyS0"}
+
+
+def find_serial_port():
+    """Auto-detect the most likely FluidNC serial port."""
+    ports = [
+        p.device
+        for p in serial.tools.list_ports.comports()
+        if p.device not in IGNORE_PORTS
+    ]
+    if not ports:
+        return None
+    preferred = [p for p in ports if p not in DEPRIORITIZED_PORTS]
+    return preferred[0] if preferred else ports[0]
+
+
+def open_serial(port, baud):
+    """Open serial connection and return the Serial object."""
+    ser = serial.Serial(port, baud, timeout=2)
+    time.sleep(0.1)
+    # Drain any buffered startup messages
+    while ser.in_waiting:
+        ser.readline()
+    return ser
+
+
+def send_command(ser, command, timeout=5.0, silence=1.0):
+    """Send a command and collect response lines."""
+    # Clear input buffer
+    while ser.in_waiting:
+        ser.readline()
+
+    ser.write((command + "\n").encode())
+    ser.flush()
+    time.sleep(0.2)
+
+    lines = []
+    start = time.time()
+    last_data = start
+    got_data = False
+
+    while time.time() - start < timeout:
+        if ser.in_waiting:
+            raw = ser.readline().decode("utf-8", errors="replace").strip()
+            if raw:
+                lines.append(raw)
+                got_data = True
+                last_data = time.time()
+                if raw.lower() == "ok" or raw.lower().startswith("error"):
+                    break
+        else:
+            if got_data and (time.time() - last_data > silence):
+                break
+            time.sleep(0.05)
+
+    return lines
+
+
+# ── XMODEM-1K/CRC16 implementation ──────────────────────────────────────────
+
+SOH = 0x01  # 128-byte block header
+STX = 0x02  # 1024-byte block header
+EOT = 0x04  # End of transmission
+ACK = 0x06
+NAK = 0x15
+CAN = 0x18
+CRCC = 0x43  # 'C' — CRC mode request
+
+
+def _crc16(data):
+    """XMODEM CRC-16-CCITT (poly 0x1021, init 0x0000)."""
+    crc = 0x0000
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
+
+def xmodem_send(ser, data, quiet=False):
+    """Send data to the serial port using XMODEM-1K with CRC16.
+
+    Expects the receiver to already be waiting (sending 'C' characters).
+    """
+    BLOCK_SIZE = 1024
+    PAD = 0x1A  # SUB character, standard XMODEM padding
+
+    # Wait for 'C' from receiver (CRC mode handshake)
+    if not quiet:
+        print("  Waiting for receiver ready...", end="", flush=True)
+
+    start = time.time()
+    ready = False
+    while time.time() - start < 30:
+        if ser.in_waiting:
+            ch = ser.read(1)
+            if ch == bytes([CRCC]):
+                ready = True
+                break
+            # Discard other characters (status messages, etc.)
+        time.sleep(0.1)
+
+    if not ready:
+        raise TimeoutError("Controller did not send 'C' — XMODEM handshake failed")
+
+    if not quiet:
+        print(" ready.")
+
+    # Split data into 1024-byte blocks
+    stream = io.BytesIO(data if isinstance(data, bytes) else data.encode("utf-8"))
+    block_num = 1
+    total_sent = 0
+
+    while True:
+        chunk = stream.read(BLOCK_SIZE)
+        if not chunk:
+            break
+
+        # Pad last block
+        if len(chunk) < BLOCK_SIZE:
+            chunk = chunk + bytes([PAD] * (BLOCK_SIZE - len(chunk)))
+
+        crc = _crc16(chunk)
+        packet = (
+            bytes([STX, block_num & 0xFF, (255 - block_num) & 0xFF])
+            + chunk
+            + struct.pack(">H", crc)
+        )
+
+        # Send with retry
+        max_retries = 5
+        for attempt in range(max_retries):
+            ser.write(packet)
+            ser.flush()
+
+            # Wait for ACK/NAK
+            ack_start = time.time()
+            while time.time() - ack_start < 10:
+                if ser.in_waiting:
+                    resp = ser.read(1)
+                    if resp == bytes([ACK]):
+                        total_sent += len(chunk)
+                        if not quiet:
+                            print(f"\r  Block {block_num}: {total_sent} bytes sent", end="", flush=True)
+                        break
+                    elif resp == bytes([NAK]) or resp == bytes([CRCC]):
+                        break  # Retry
+                    elif resp == bytes([CAN]):
+                        raise IOError("Transfer cancelled by receiver")
+                time.sleep(0.05)
+            else:
+                if attempt == max_retries - 1:
+                    raise TimeoutError(f"No ACK for block {block_num} after {max_retries} attempts")
+                continue
+            break
+
+        block_num += 1
+
+    # Send EOT
+    for _ in range(3):
+        ser.write(bytes([EOT]))
+        ser.flush()
+        eot_start = time.time()
+        while time.time() - eot_start < 5:
+            if ser.in_waiting:
+                resp = ser.read(1)
+                if resp == bytes([ACK]):
+                    if not quiet:
+                        print(f"\n  Transfer complete: {stream.tell()} bytes in {block_num - 1} blocks")
+                    return True
+            time.sleep(0.05)
+
+    raise IOError("EOT not acknowledged")
+
+
+# ── Config helpers ───────────────────────────────────────────────────────────
+
+def download_config(ser):
+    """Download config YAML from controller via $CD."""
+    lines = send_command(ser, "$CD", timeout=10.0, silence=1.5)
+
+    yaml_lines = []
+    for line in lines:
+        lower = line.lower()
+        if lower == "ok" or lower.startswith("error"):
+            continue
+        if line.startswith("["):
+            continue
+        yaml_lines.append(line)
+
+    text = "\n".join(yaml_lines)
+    if not text.strip():
+        raise ValueError("$CD returned no YAML content")
+
+    # Validate
+    yaml.safe_load(text)
+    return text
+
+
+def get_config_filename(ser):
+    """Get the active config filename from FluidNC."""
+    lines = send_command(ser, "$Config/Filename")
+    for line in lines:
+        if "=" in line and "Filename" in line:
+            return line.split("=", 1)[1].strip()
+    return "config.yaml"
+
+
+def upload_config(ser, yaml_content, filename=None):
+    """Upload config YAML to controller via XMODEM."""
+    if filename is None:
+        filename = get_config_filename(ser)
+
+    print(f"  Initiating XMODEM upload as /littlefs/{filename}...")
+    ser.write(f"$XR={filename}\n".encode())
+    ser.flush()
+    time.sleep(0.5)
+
+    xmodem_send(ser, yaml_content)
+    return True
+
+
+def set_yaml_value(config, path, value):
+    """Return a new config dict with the value at path replaced."""
+    import copy
+    keys = path.split("/")
+    result = copy.deepcopy(config)
+    node = result
+    for key in keys[:-1]:
+        if key not in node or not isinstance(node[key], dict):
+            node[key] = {}
+        node = node[key]
+
+    # Auto-detect value type
+    if isinstance(value, str):
+        lower = value.lower()
+        if lower in ("true", "false"):
+            value = lower == "true"
+        else:
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass  # Keep as string
+
+    node[keys[-1]] = value
+    return result
+
+
+def reboot_controller(ser):
+    """Send $Bye and wait for the Grbl startup banner."""
+    print("  Rebooting controller...")
+    ser.write(b"$Bye\n")
+    ser.flush()
+
+    start = time.time()
+    while time.time() - start < 15:
+        if ser.in_waiting:
+            line = ser.readline().decode("utf-8", errors="replace").strip()
+            if line:
+                print(f"    {line}")
+            if line.startswith("Grbl") or "fluidnc" in line.lower():
+                print("  Controller restarted successfully.")
+                return True
+        time.sleep(0.1)
+
+    print("  Warning: no startup banner received (controller may still be rebooting)")
+    return False
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_dump(ser, args):
+    """Dump current config YAML to stdout."""
+    text = download_config(ser)
+    print(text)
+
+
+def cmd_download(ser, args):
+    """Download config to a local file."""
+    text = download_config(ser)
+    with open(args.filename, "w") as f:
+        f.write(text)
+    print(f"Config saved to {args.filename}")
+
+
+def cmd_upload(ser, args):
+    """Upload a local YAML file to the controller."""
+    with open(args.filename) as f:
+        content = f.read()
+
+    # Validate YAML
+    yaml.safe_load(content)
+    print(f"Uploading {args.filename} to controller...")
+
+    upload_config(ser, content)
+
+    if not args.no_reboot:
+        reboot_controller(ser)
+    else:
+        print("  Skipping reboot (--no-reboot). Changes take effect after next reboot.")
+
+
+def cmd_set(ser, args):
+    """Set a config value by YAML path."""
+    print(f"Downloading current config...")
+    text = download_config(ser)
+    config = yaml.safe_load(text)
+
+    # Show current value
+    node = config
+    for key in args.path.split("/"):
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        else:
+            node = None
+            break
+    print(f"  Current: {args.path} = {node}")
+    print(f"  New:     {args.path} = {args.value}")
+
+    updated = set_yaml_value(config, args.path, args.value)
+    updated_yaml = yaml.dump(updated, default_flow_style=False, sort_keys=False)
+
+    if args.dry_run:
+        print("\n[DRY RUN] Would upload:\n")
+        print(updated_yaml)
+        return
+
+    print("Uploading modified config...")
+    upload_config(ser, updated_yaml)
+
+    if not args.no_reboot:
+        reboot_controller(ser)
+    else:
+        print("  Skipping reboot (--no-reboot). Changes take effect after next reboot.")
+
+
+def cmd_invert(ser, args):
+    """Toggle direction_inverted for an axis."""
+    axis = args.axis.lower()
+    if axis not in ("x", "y"):
+        print(f"Error: axis must be 'x' or 'y', got '{axis}'", file=sys.stderr)
+        sys.exit(1)
+
+    pin_path = f"axes/{axis}/motor0/stepstick/direction_pin"
+
+    print(f"Downloading current config...")
+    text = download_config(ser)
+    config = yaml.safe_load(text)
+
+    # Read current pin value
+    current = None
+    try:
+        current = config["axes"][axis]["motor0"]["stepstick"]["direction_pin"]
+    except (KeyError, TypeError):
+        pass
+
+    if current is None:
+        # Fall back to serial query
+        lines = send_command(ser, f"$/{pin_path}")
+        for line in lines:
+            if "=" in line and "direction_pin" in line:
+                current = line.split("=", 1)[1].strip()
+                break
+
+    if current is None:
+        print(f"Error: could not read {pin_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if ":low" in str(current):
+        new_val = str(current).replace(":low", "")
+    else:
+        new_val = str(current) + ":low"
+
+    inverted = ":low" in new_val
+    print(f"  {axis.upper()} axis direction_pin: {current} → {new_val}")
+    print(f"  direction_inverted: {inverted}")
+
+    updated = set_yaml_value(config, pin_path, new_val)
+    updated_yaml = yaml.dump(updated, default_flow_style=False, sort_keys=False)
+
+    if args.dry_run:
+        print("\n[DRY RUN] Would upload:\n")
+        print(updated_yaml)
+        return
+
+    print("Uploading modified config...")
+    upload_config(ser, updated_yaml)
+
+    if not args.no_reboot:
+        reboot_controller(ser)
+    else:
+        print("  Skipping reboot (--no-reboot). Changes take effect after next reboot.")
+
+    print(f"\nDone. {axis.upper()} axis direction {'inverted' if inverted else 'normal'}.")
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FluidNC config editor — modify settings over USB serial",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-p", "--port", help="Serial port (default: auto-detect)")
+    parser.add_argument("-b", "--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--no-reboot", action="store_true", help="Skip reboot after changes")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without applying")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # dump
+    subparsers.add_parser("dump", help="Dump current config YAML to stdout")
+
+    # download
+    p_download = subparsers.add_parser("download", help="Download config to a local file")
+    p_download.add_argument("filename", help="Output filename")
+
+    # upload
+    p_upload = subparsers.add_parser("upload", help="Upload a YAML file to the controller")
+    p_upload.add_argument("filename", help="YAML file to upload")
+
+    # set
+    p_set = subparsers.add_parser("set", help="Set a config value by YAML path")
+    p_set.add_argument("path", help="YAML path (e.g., axes/x/steps_per_mm)")
+    p_set.add_argument("value", help="New value")
+
+    # invert
+    p_invert = subparsers.add_parser("invert", help="Toggle direction inversion for an axis")
+    p_invert.add_argument("axis", choices=["x", "y", "X", "Y"], help="Axis to toggle")
+
+    args = parser.parse_args()
+
+    # Resolve port
+    port = args.port or find_serial_port()
+    if not port:
+        print("Error: no serial port found. Use -p to specify.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Connecting to {port} at {args.baud} baud...")
+
+    try:
+        ser = open_serial(port, args.baud)
+    except serial.SerialException as e:
+        print(f"Error opening {port}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        handlers = {
+            "dump": cmd_dump,
+            "download": cmd_download,
+            "upload": cmd_upload,
+            "set": cmd_set,
+            "invert": cmd_invert,
+        }
+        handlers[args.command](ser, args)
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
+    except (ConnectionError, ValueError, TimeoutError, IOError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()
