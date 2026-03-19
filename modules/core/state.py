@@ -181,6 +181,13 @@ class AppState:
         self.mqtt_device_id = "dune_weaver"  # Device ID for Home Assistant
         self.mqtt_device_name = "Dune Weaver"  # Device display name
 
+        # Controller (ESP32/DLC32) HTTP URL for config file uploads
+        # FluidNC pin settings cannot be changed at runtime — they require
+        # editing the config YAML on the controller's filesystem via HTTP.
+        # Set to the ESP32's HTTP URL (e.g., "http://fluidnc.local") if
+        # the controller is network-accessible. None = auto-discover.
+        self.esp32_url = None
+
         # Security settings
         self.security_mode = "off"  # "off", "lockdown", "play_only"
         self.security_password_hash = ""  # SHA-256 hex digest
@@ -551,6 +558,7 @@ class AppState:
             "gear_ratio_override": self.gear_ratio_override,
             "security_mode": self.security_mode,
             "security_password_hash": self.security_password_hash,
+            "esp32_url": self.esp32_url,
         }
 
     def to_dict(self):
@@ -672,6 +680,7 @@ class AppState:
         self.gear_ratio_override = data.get("gear_ratio_override", None)
         self.security_mode = data.get("security_mode", "off")
         self.security_password_hash = data.get("security_password_hash", "")
+        self.esp32_url = data.get("esp32_url", None)
 
     def from_dict(self, data):
         """Update state from a combined dictionary (backward compatibility / migration)."""

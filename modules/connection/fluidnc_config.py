@@ -4,9 +4,15 @@ Provides functions to read/write FluidNC settings via the main serial/WebSocket
 connection. Uses $Config/Dump for bulk reads (single round-trip) and individual
 $/path=value writes.
 
+Pin settings (direction_pin, etc.) cannot be changed at runtime — FluidNC
+requires editing the config YAML file on the controller's filesystem and
+rebooting. For these settings, we download the YAML via $CD, modify it,
+upload via HTTP to FluidNC's web server, and reboot with $Bye.
+
 Targets FluidNC-based boards with bipolar stepper motors (DLC32, MKS boards).
 """
 
+import copy
 import time
 import logging
 import yaml
@@ -321,7 +327,14 @@ def save_config() -> bool:
 def toggle_direction_pin(axis: str) -> tuple[bool, bool]:
     """Toggle :low on the direction pin for the given axis.
 
+    Pin objects cannot be changed at runtime in FluidNC — this function
+    downloads the config YAML, modifies the pin value, uploads the modified
+    file to the controller via HTTP, and reboots.
+
     Returns (success, new_inverted_state).
+
+    Raises:
+        RuntimeError: If the ESP32 is not reachable via HTTP.
     """
     path = f"axes/{axis}/motor0/stepstick/direction_pin"
     current = read_setting(path)
@@ -333,5 +346,187 @@ def toggle_direction_pin(axis: str) -> tuple[bool, bool]:
     else:
         new_val = current + ":low"
 
-    success = write_setting(path, new_val)
+    success = update_config_yaml(path, new_val)
     return (success, ":low" in new_val)
+
+
+###############################################################################
+# Config YAML download / modify / upload (for non-runtime settings like pins)
+###############################################################################
+
+_ESP32_CANDIDATE_URLS = [
+    "http://fluidnc.local",
+    "http://fluidnc.local:80",
+    "http://fluidnc.local:81",
+]
+
+
+def discover_esp32_url() -> str | None:
+    """Try to find the ESP32's HTTP URL by probing known candidates.
+
+    Checks state.esp32_url first (user override), then tries mDNS defaults.
+    Returns the first URL that responds, or None.
+    """
+    import requests as _requests
+
+    if state.esp32_url:
+        try:
+            resp = _requests.get(state.esp32_url, timeout=3)
+            if resp.status_code < 500:
+                logger.info(f"ESP32 reachable at configured URL: {state.esp32_url}")
+                return state.esp32_url
+        except _requests.RequestException:
+            logger.warning(f"Configured ESP32 URL unreachable: {state.esp32_url}")
+
+    for url in _ESP32_CANDIDATE_URLS:
+        try:
+            resp = _requests.get(url, timeout=3)
+            if resp.status_code < 500:
+                logger.info(f"ESP32 discovered at: {url}")
+                return url
+        except _requests.RequestException:
+            continue
+
+    logger.warning("ESP32 not reachable via HTTP at any known URL")
+    return None
+
+
+def download_config_yaml() -> str:
+    """Download the full config YAML from the controller via $CD.
+
+    Returns the raw YAML text (non-YAML lines like [MSG:...] and 'ok' filtered out).
+
+    Raises:
+        ConnectionError: If not connected to the controller.
+        ValueError: If $CD returned no usable YAML content.
+    """
+    lines = send_command("$CD", timeout=10.0, silence=1.5)
+
+    yaml_lines = []
+    for line in lines:
+        if line.lower() == "ok" or line.lower().startswith("error"):
+            continue
+        if line.startswith("["):
+            continue
+        yaml_lines.append(line)
+
+    yaml_text = "\n".join(yaml_lines)
+    if not yaml_text.strip():
+        raise ValueError("$CD returned no YAML content")
+
+    # Validate it parses
+    yaml.safe_load(yaml_text)
+    return yaml_text
+
+
+def _set_yaml_value(data: dict, path: str, value) -> dict:
+    """Return a new dict with the value at the slash-separated path replaced.
+
+    Creates intermediate dicts if needed. Does not mutate the original.
+    """
+    keys = path.split("/")
+    result = copy.deepcopy(data)
+    node = result
+    for key in keys[:-1]:
+        if key not in node or not isinstance(node[key], dict):
+            node[key] = {}
+        node = node[key]
+    node[keys[-1]] = value
+    return result
+
+
+def upload_config_to_controller(yaml_content: str, esp32_url: str | None = None) -> bool:
+    """Upload a modified config YAML to the ESP32 via FluidNC's HTTP API.
+
+    Uses multipart form upload to /upload_localfs, which writes directly to
+    the controller's LittleFS filesystem.
+
+    Args:
+        yaml_content: The full YAML config file content.
+        esp32_url: Base URL of the ESP32 (e.g., "http://fluidnc.local").
+                   If None, auto-discovers.
+
+    Returns:
+        True if upload succeeded, False otherwise.
+
+    Raises:
+        RuntimeError: If ESP32 is not reachable via HTTP.
+    """
+    import requests as _requests
+
+    url = esp32_url or discover_esp32_url()
+    if not url:
+        raise RuntimeError(
+            "Cannot upload config: ESP32 is not reachable via HTTP. "
+            "Set esp32_url in settings to the controller's HTTP address "
+            "(e.g., http://fluidnc.local), or ensure the ESP32 has WiFi enabled."
+        )
+
+    filename = get_config_filename()
+    upload_url = f"{url.rstrip('/')}/upload_localfs"
+
+    try:
+        resp = _requests.post(
+            upload_url,
+            files={"myfile": (filename, yaml_content.encode("utf-8"), "text/yaml")},
+            data={"path": f"/littlefs/{filename}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info(f"Config uploaded to {upload_url} as /littlefs/{filename}")
+            return True
+        else:
+            logger.error(f"Config upload failed: HTTP {resp.status_code} — {resp.text}")
+            return False
+    except _requests.RequestException as e:
+        logger.error(f"Config upload request failed: {e}")
+        raise RuntimeError(f"Failed to upload config to ESP32 at {upload_url}: {e}")
+
+
+def update_config_yaml(path: str, value) -> bool:
+    """High-level: modify a single value in the controller's config YAML.
+
+    Downloads the current config, modifies the value, uploads the new config,
+    and reboots the controller so the change takes effect.
+
+    Use this for settings that cannot be changed at runtime (e.g., pin objects).
+    For runtime-settable values, use write_setting() instead.
+
+    Args:
+        path: FluidNC config tree path (e.g., "axes/x/motor0/stepstick/direction_pin").
+        value: The new value to set.
+
+    Returns:
+        True if the config was successfully updated and controller rebooted.
+
+    Raises:
+        ConnectionError: If not connected to the controller.
+        ValueError: If the config YAML could not be downloaded or parsed.
+        RuntimeError: If the ESP32 is not reachable via HTTP for upload.
+    """
+    logger.info(f"Updating config YAML: {path} = {value}")
+
+    # 1. Download current config
+    yaml_text = download_config_yaml()
+    config = yaml.safe_load(yaml_text)
+
+    # 2. Modify the value
+    updated_config = _set_yaml_value(config, path, value)
+
+    # 3. Serialize back to YAML
+    updated_yaml = yaml.dump(updated_config, default_flow_style=False, sort_keys=False)
+
+    # 4. Upload to controller
+    uploaded = upload_config_to_controller(updated_yaml)
+    if not uploaded:
+        return False
+
+    # 5. Reboot controller to apply
+    logger.info("Rebooting controller to apply config changes...")
+    try:
+        send_command("$Bye", timeout=5.0)
+    except ConnectionError:
+        logger.warning("Lost connection after $Bye (expected during reboot)")
+
+    logger.info(f"Config updated successfully: {path} = {value}")
+    return True

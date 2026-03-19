@@ -4185,11 +4185,14 @@ async def fluidnc_config_write(update: FluidNCConfigUpdate):
                         continue
 
                     if key == "direction_inverted":
-                        # Toggle :low on direction pin
+                        # Toggle :low on direction pin.
+                        # Pin settings require config YAML upload + reboot
+                        # (FluidNC does not support runtime pin changes).
                         success, new_state = fluidnc_config.toggle_direction_pin(axis)
                         if success:
-                            changes_applied.append(f"{axis}/direction_pin")
-                            restart_required = True
+                            changes_applied.append(f"{axis}/direction_pin (reboot)")
+                            # toggle_direction_pin already reboots the controller
+                            restart_required = False
                         continue
 
                     path_template = _AXIS_KEY_TO_PATH.get(key)
@@ -4218,8 +4221,15 @@ async def fluidnc_config_write(update: FluidNCConfigUpdate):
             if x_steps is not None or y_steps is not None:
                 state.save()
 
-        # Persist to flash
-        saved = fluidnc_config.save_config() if changes_applied else False
+        # Persist to flash (skip if controller already rebooted from pin change)
+        pin_changed = any("(reboot)" in c for c in changes_applied)
+        non_pin_changes = [c for c in changes_applied if "(reboot)" not in c]
+        if non_pin_changes:
+            saved = fluidnc_config.save_config()
+        elif pin_changed:
+            saved = True  # Pin change already uploaded and rebooted
+        else:
+            saved = False
         return saved
 
     try:
@@ -4232,6 +4242,9 @@ async def fluidnc_config_write(update: FluidNCConfigUpdate):
         }
     except ConnectionError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        # ESP32 not reachable via HTTP (needed for pin changes)
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"FluidNC config write error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
