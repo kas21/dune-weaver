@@ -5,6 +5,9 @@ Works entirely over USB serial using XMODEM-1K/CRC16 file transfer.
 No WiFi or HTTP needed.
 
 Usage:
+    # Show firmware version and controller status
+    ./scripts/fluidnc-config info
+
     # Toggle direction inversion on an axis
     ./scripts/fluidnc-config invert x
     ./scripts/fluidnc-config invert y
@@ -323,6 +326,23 @@ def reboot_controller(ser):
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+def cmd_info(ser, args):
+    """Show firmware version and status."""
+    lines = send_command(ser, "$I", timeout=3.0)
+    for line in lines:
+        if line.lower() != "ok":
+            print(line)
+
+    # Also show current status
+    ser.write(b"?\n")
+    ser.flush()
+    time.sleep(0.3)
+    while ser.in_waiting:
+        line = ser.readline().decode("utf-8", errors="replace").strip()
+        if line and "<" in line:
+            print(f"Status: {line}")
+
+
 def cmd_dump(ser, args):
     """Dump current config YAML to stdout."""
     text = download_config(ser)
@@ -462,6 +482,9 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # info
+    subparsers.add_parser("info", help="Show firmware version and status")
+
     # dump
     subparsers.add_parser("dump", help="Dump current config YAML to stdout")
 
@@ -500,6 +523,7 @@ def main():
 
     try:
         handlers = {
+            "info": cmd_info,
             "dump": cmd_dump,
             "download": cmd_download,
             "upload": cmd_upload,
